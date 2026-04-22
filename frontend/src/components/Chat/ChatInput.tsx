@@ -10,8 +10,14 @@ interface ModelOption {
   label: string;
   description: string;
   avatarUrl: string;
+  provider: string;
   providerLabel?: string;
   recommended?: boolean;
+}
+
+interface ProviderOption {
+  id: string;
+  label: string;
 }
 
 const FALLBACK_MODELS: ModelOption[] = [
@@ -20,6 +26,7 @@ const FALLBACK_MODELS: ModelOption[] = [
     label: 'Claude Opus 4.6',
     description: 'Anthropic',
     avatarUrl: 'https://huggingface.co/api/avatars/Anthropic',
+    provider: 'anthropic',
     providerLabel: 'Anthropic',
     recommended: true,
   },
@@ -28,6 +35,7 @@ const FALLBACK_MODELS: ModelOption[] = [
     label: 'MiniMax M2.7',
     description: 'HF Router',
     avatarUrl: 'https://huggingface.co/api/avatars/MiniMaxAI',
+    provider: 'huggingface',
     providerLabel: 'Hugging Face Router',
     recommended: true,
   },
@@ -36,6 +44,7 @@ const FALLBACK_MODELS: ModelOption[] = [
     label: 'Kimi K2.6',
     description: 'HF Router',
     avatarUrl: 'https://huggingface.co/api/avatars/moonshotai',
+    provider: 'huggingface',
     providerLabel: 'Hugging Face Router',
   },
   {
@@ -43,6 +52,7 @@ const FALLBACK_MODELS: ModelOption[] = [
     label: 'GLM 5.1',
     description: 'HF Router',
     avatarUrl: 'https://huggingface.co/api/avatars/zai-org',
+    provider: 'huggingface',
     providerLabel: 'Hugging Face Router',
   },
 ];
@@ -54,6 +64,7 @@ const toModelOption = (value: any): ModelOption | null => {
     label: String(value.label),
     description: String(value.description || value.providerLabel || ''),
     avatarUrl: String(value.avatarUrl || 'https://huggingface.co/api/avatars/huggingface'),
+    provider: String(value.provider || ''),
     providerLabel: value.providerLabel ? String(value.providerLabel) : undefined,
     recommended: Boolean(value.recommended),
   };
@@ -72,6 +83,7 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
   const [input, setInput] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>(FALLBACK_MODELS);
+  const [providerOptions, setProviderOptions] = useState<ProviderOption[]>([]);
   const [selectedModelPath, setSelectedModelPath] = useState<string>(FALLBACK_MODELS[0].id);
   const [modelAnchorEl, setModelAnchorEl] = useState<null | HTMLElement>(null);
 
@@ -87,9 +99,17 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
         const available = rawAvailable
           .map(toModelOption)
           .filter((value: ModelOption | null): value is ModelOption => value !== null);
+        const providers = Array.isArray(data.providers)
+          ? data.providers
+            .filter((value: any) => value && value.id && value.label)
+            .map((value: any) => ({ id: String(value.id), label: String(value.label) }))
+          : [];
 
         if (available.length > 0) {
           setModelOptions(available);
+        }
+        if (providers.length > 0) {
+          setProviderOptions(providers);
         }
         if (typeof data.current === 'string' && data.current) {
           setSelectedModelPath(data.current);
@@ -118,8 +138,14 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
   }, [sessionId]);
 
   const selectedModel = modelOptions.find((model) => model.id === selectedModelPath)
-    || toModelOption({ id: selectedModelPath, label: selectedModelPath, description: '', avatarUrl: 'https://huggingface.co/api/avatars/huggingface' })
+    || toModelOption({ id: selectedModelPath, label: selectedModelPath, description: '', avatarUrl: 'https://huggingface.co/api/avatars/huggingface', provider: '' })
     || modelOptions[0];
+  const groupedModels = (providerOptions.length > 0 ? providerOptions : Array.from(new Map(modelOptions.map((model) => [model.provider, { id: model.provider, label: model.providerLabel || model.provider }])).values()))
+    .map((provider) => ({
+      provider,
+      models: modelOptions.filter((model) => model.provider === provider.id),
+    }))
+    .filter((group) => group.models.length > 0);
 
   useEffect(() => {
     if (!disabled && !isProcessing && inputRef.current) {
@@ -329,50 +355,57 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
             },
           }}
         >
-          {modelOptions.map((model) => (
-            <MenuItem
-              key={model.id}
-              onClick={() => handleSelectModel(model.id)}
-              selected={selectedModelPath === model.id}
-              sx={{
-                py: 1.5,
-                '&.Mui-selected': {
-                  bgcolor: 'rgba(255,255,255,0.05)',
-                },
-              }}
-            >
-              <ListItemIcon>
-                <img
-                  src={model.avatarUrl}
-                  alt={model.label}
-                  style={{ width: 24, height: 24, borderRadius: '4px', objectFit: 'cover' }}
-                />
-              </ListItemIcon>
-              <ListItemText
-                primary={(
-                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                    {model.label}
-                    {model.recommended && (
-                      <Chip
-                        label="Recommended"
-                        size="small"
-                        sx={{
-                          height: '18px',
-                          fontSize: '10px',
-                          bgcolor: 'var(--accent-yellow)',
-                          color: '#000',
-                          fontWeight: 600,
-                        }}
-                      />
+          {groupedModels.map(({ provider, models }) => (
+            <Box key={provider.id}>
+              <Typography sx={{ px: 2, pt: 1.5, pb: 0.5, fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--muted-text)' }}>
+                {provider.label}
+              </Typography>
+              {models.map((model) => (
+                <MenuItem
+                  key={model.id}
+                  onClick={() => handleSelectModel(model.id)}
+                  selected={selectedModelPath === model.id}
+                  sx={{
+                    py: 1.5,
+                    '&.Mui-selected': {
+                      bgcolor: 'rgba(255,255,255,0.05)',
+                    },
+                  }}
+                >
+                  <ListItemIcon>
+                    <img
+                      src={model.avatarUrl}
+                      alt={model.label}
+                      style={{ width: 24, height: 24, borderRadius: '4px', objectFit: 'cover' }}
+                    />
+                  </ListItemIcon>
+                  <ListItemText
+                    primary={(
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        {model.label}
+                        {model.recommended && (
+                          <Chip
+                            label="Recommended"
+                            size="small"
+                            sx={{
+                              height: '18px',
+                              fontSize: '10px',
+                              bgcolor: 'var(--accent-yellow)',
+                              color: '#000',
+                              fontWeight: 600,
+                            }}
+                          />
+                        )}
+                      </Box>
                     )}
-                  </Box>
-                )}
-                secondary={model.description || model.providerLabel}
-                secondaryTypographyProps={{
-                  sx: { fontSize: '12px', color: 'var(--muted-text)' },
-                }}
-              />
-            </MenuItem>
+                    secondary={model.description || model.providerLabel}
+                    secondaryTypographyProps={{
+                      sx: { fontSize: '12px', color: 'var(--muted-text)' },
+                    }}
+                  />
+                </MenuItem>
+              ))}
+            </Box>
           ))}
         </Menu>
       </Box>
