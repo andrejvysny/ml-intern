@@ -23,10 +23,12 @@ ToolCall = ChatCompletionMessageToolCall
 
 
 def _resolve_hf_router_params(
-    model_name: str, session_hf_token: str | None = None
+    model_name: str,
+    session_hf_token: str | None = None,
+    local_model_base_url: str | None = None,
 ) -> dict:
     """
-    Build LiteLLM kwargs for HuggingFace Router models.
+    Build LiteLLM kwargs for HuggingFace Router models and local models.
 
     api-inference.huggingface.co is deprecated; the new router lives at
     router.huggingface.co/<provider>/v3/openai.  LiteLLM's built-in
@@ -36,6 +38,10 @@ def _resolve_hf_router_params(
     Input format:  huggingface/<router_provider>/<org>/<model>
     Example:       huggingface/novita/moonshotai/kimi-k2.5
 
+    For local models (ollama/, ollama_chat/, vllm/) litellm handles
+    routing natively. For openai/ with a local_model_base_url, we inject
+    the api_base to route to the local endpoint.
+
     Token resolution (first non-empty wins):
       1. INFERENCE_TOKEN env — shared key on the hosted Space so inference
          is free for users and billed to the Space owner.
@@ -43,6 +49,18 @@ def _resolve_hf_router_params(
          resolved from env / huggingface-cli login / cached token file.
       3. HF_TOKEN env — belt-and-suspenders fallback for CLI users.
     """
+    # Local models — litellm handles ollama/vllm natively
+    if model_name.startswith(("ollama/", "ollama_chat/", "vllm/")):
+        return {"model": model_name}
+
+    # OpenAI-compatible local endpoint (e.g. llama.cpp, TGI)
+    if model_name.startswith("openai/") and local_model_base_url:
+        return {
+            "model": model_name,
+            "api_base": local_model_base_url,
+            "api_key": "not-needed",
+        }
+
     if not model_name.startswith("huggingface/"):
         return {"model": model_name}
 
@@ -519,7 +537,12 @@ class Handlers:
             try:
                 # ── Call the LLM (streaming or non-streaming) ──
                 llm_params = _resolve_hf_router_params(
-                    session.config.model_name, session.hf_token
+                    session.config.model_name,
+                    session.hf_token,
+                    local_model_base_url=(
+                        session.config.local_model_base_url
+                        if session.mode_flags.local_models else None
+                    ),
                 )
                 if session.stream:
                     llm_result = await _call_llm_streaming(session, messages, tools, llm_params)
@@ -1158,23 +1181,34 @@ async def submission_loop(
     hf_token: str | None = None,
     local_mode: bool = False,
     stream: bool = True,
+    mode_flags: "ModeFlags | None" = None,
 ) -> None:
     """
     Main agent loop - processes submissions and dispatches to handlers.
     This is the core of the agent (like submission_loop in codex.rs:1259-1340)
     """
+    from agent.config import ModeFlags, resolve_mode_flags
+
+    effective_flags = mode_flags
+    if effective_flags is None and config is not None:
+        effective_flags = resolve_mode_flags(config)
 
     # Create session with tool router
     session = Session(
         event_queue, config=config, tool_router=tool_router, hf_token=hf_token,
-        local_mode=local_mode, stream=stream,
+        local_mode=local_mode, stream=stream, mode_flags=effective_flags,
     )
     if session_holder is not None:
         session_holder[0] = session
-    logger.info("Agent loop started")
+    logger.info("Agent loop started (mode=%s)", config.execution_mode.value if config else "cloud")
 
     # Retry any failed uploads from previous sessions (fire-and-forget)
-    if config and config.save_sessions:
+    # Skip when session uploads are disabled (hybrid/local mode)
+    uploads_enabled = (
+        config and config.save_sessions
+        and (effective_flags is None or effective_flags.session_uploads)
+    )
+    if uploads_enabled:
         Session.retry_failed_uploads_detached(
             directory="session_logs", repo_id=config.session_dataset_repo
         )

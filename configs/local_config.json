@@ -1,0 +1,7 @@
+{
+  "model_name": "ollama/llama3.1",
+  "execution_mode": "local",
+  "save_sessions": false,
+  "local_model_max_tokens": 128000,
+  "mcpServers": {}
+}

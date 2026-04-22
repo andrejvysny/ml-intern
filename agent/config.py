@@ -1,6 +1,8 @@
 import json
 import os
 import re
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Union
 
@@ -18,6 +20,43 @@ from pydantic import BaseModel
 MCPServerConfig = Union[StdioMCPServer, RemoteMCPServer]
 
 
+class ExecutionMode(str, Enum):
+    """Controls where data flows and what capabilities are available."""
+    CLOUD = "cloud"    # Cloud LLM, cloud training (HF Jobs/Sandbox), all tools
+    HYBRID = "hybrid"  # Cloud LLM, local training, research tools, no session uploads
+    LOCAL = "local"    # Local LLM (ollama/vllm), local training, zero network calls
+
+
+@dataclass(frozen=True)
+class ModeFlags:
+    """Derived flags from ExecutionMode — each subsystem checks one flag."""
+    local_tools: bool        # bash/read/write/edit run via subprocess
+    local_models: bool       # LLM served from local endpoint
+    network_tools: bool      # docs, papers, github, datasets tools
+    session_uploads: bool    # trajectory upload to HF Hub
+    mcp_servers: bool        # MCP server connections
+
+
+def resolve_mode_flags(config: "Config") -> ModeFlags:
+    """Expand execution_mode enum into per-subsystem boolean flags."""
+    mode = config.execution_mode
+    if mode == ExecutionMode.LOCAL:
+        return ModeFlags(
+            local_tools=True, local_models=True,
+            network_tools=False, session_uploads=False, mcp_servers=False,
+        )
+    if mode == ExecutionMode.HYBRID:
+        return ModeFlags(
+            local_tools=True, local_models=False,
+            network_tools=True, session_uploads=False, mcp_servers=True,
+        )
+    # CLOUD (default)
+    return ModeFlags(
+        local_tools=False, local_models=False,
+        network_tools=True, session_uploads=True, mcp_servers=True,
+    )
+
+
 class Config(BaseModel):
     """Configuration manager"""
 
@@ -32,6 +71,12 @@ class Config(BaseModel):
     # Permission control parameters
     confirm_cpu_jobs: bool = True
     auto_file_upload: bool = False
+
+    # Execution mode
+    execution_mode: ExecutionMode = ExecutionMode.CLOUD
+    local_model_base_url: str = "http://localhost:11434"  # ollama default
+    local_model_name: str = "ollama/llama3.1"
+    local_model_max_tokens: int = 32_000
 
 
 def substitute_env_vars(obj: Any) -> Any:

@@ -14,7 +14,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
-from agent.config import MCPServerConfig
+from agent.config import MCPServerConfig, ModeFlags
 from agent.tools.dataset_tools import (
     HF_INSPECT_DATASET_TOOL_SPEC,
     hf_inspect_dataset_handler,
@@ -129,15 +129,28 @@ class ToolRouter:
     Based on codex-rs/core/src/tools/router.rs
     """
 
-    def __init__(self, mcp_servers: dict[str, MCPServerConfig], hf_token: str | None = None, local_mode: bool = False):
+    def __init__(
+        self,
+        mcp_servers: dict[str, MCPServerConfig],
+        hf_token: str | None = None,
+        local_mode: bool = False,
+        mode_flags: ModeFlags | None = None,
+    ):
         self.tools: dict[str, ToolSpec] = {}
         self.mcp_servers: dict[str, dict[str, Any]] = {}
+        self.mode_flags = mode_flags
 
-        for tool in create_builtin_tools(local_mode=local_mode):
+        # mode_flags takes precedence over legacy local_mode bool
+        effective_mode_flags = mode_flags or ModeFlags(
+            local_tools=local_mode, local_models=False,
+            network_tools=True, session_uploads=True, mcp_servers=True,
+        )
+
+        for tool in create_builtin_tools(mode_flags=effective_mode_flags):
             self.register_tool(tool)
 
         self.mcp_client: Client | None = None
-        if mcp_servers:
+        if mcp_servers and effective_mode_flags.mcp_servers:
             mcp_servers_payload = {}
             for name, server in mcp_servers.items():
                 data = server.model_dump()
@@ -219,7 +232,9 @@ class ToolRouter:
                 logger.warning("MCP connection failed, continuing without MCP tools: %s", e)
                 self.mcp_client = None
 
-        await self.register_openapi_tool()
+        # OpenAPI tool fetches from huggingface.co — skip in local mode
+        if not self.mode_flags or self.mode_flags.network_tools:
+            await self.register_openapi_tool()
 
         total_tools = len(self.tools)
         logger.info(f"Agent ready with {total_tools} tools total")
@@ -279,96 +294,109 @@ class ToolRouter:
 # ============================================================================
 
 
-def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
-    """Create built-in tool specifications"""
-    # in order of importance
-    tools = [
-        # Research sub-agent (delegates to read-only tools in independent context)
-        ToolSpec(
-            name=RESEARCH_TOOL_SPEC["name"],
-            description=RESEARCH_TOOL_SPEC["description"],
-            parameters=RESEARCH_TOOL_SPEC["parameters"],
-            handler=research_handler,
-        ),
-        # Documentation search tools
-        ToolSpec(
-            name=EXPLORE_HF_DOCS_TOOL_SPEC["name"],
-            description=EXPLORE_HF_DOCS_TOOL_SPEC["description"],
-            parameters=EXPLORE_HF_DOCS_TOOL_SPEC["parameters"],
-            handler=explore_hf_docs_handler,
-        ),
-        ToolSpec(
-            name=HF_DOCS_FETCH_TOOL_SPEC["name"],
-            description=HF_DOCS_FETCH_TOOL_SPEC["description"],
-            parameters=HF_DOCS_FETCH_TOOL_SPEC["parameters"],
-            handler=hf_docs_fetch_handler,
-        ),
-        # Paper discovery and reading
-        ToolSpec(
-            name=HF_PAPERS_TOOL_SPEC["name"],
-            description=HF_PAPERS_TOOL_SPEC["description"],
-            parameters=HF_PAPERS_TOOL_SPEC["parameters"],
-            handler=hf_papers_handler,
-        ),
-        # Dataset inspection tool (unified)
-        ToolSpec(
-            name=HF_INSPECT_DATASET_TOOL_SPEC["name"],
-            description=HF_INSPECT_DATASET_TOOL_SPEC["description"],
-            parameters=HF_INSPECT_DATASET_TOOL_SPEC["parameters"],
-            handler=hf_inspect_dataset_handler,
-        ),
-        # Planning and job management tools
-        ToolSpec(
-            name=PLAN_TOOL_SPEC["name"],
-            description=PLAN_TOOL_SPEC["description"],
-            parameters=PLAN_TOOL_SPEC["parameters"],
-            handler=plan_tool_handler,
-        ),
-        ToolSpec(
-            name=HF_JOBS_TOOL_SPEC["name"],
-            description=HF_JOBS_TOOL_SPEC["description"],
-            parameters=HF_JOBS_TOOL_SPEC["parameters"],
-            handler=hf_jobs_handler,
-        ),
-        # HF Repo management tools
-        ToolSpec(
-            name=HF_REPO_FILES_TOOL_SPEC["name"],
-            description=HF_REPO_FILES_TOOL_SPEC["description"],
-            parameters=HF_REPO_FILES_TOOL_SPEC["parameters"],
-            handler=hf_repo_files_handler,
-        ),
-        ToolSpec(
-            name=HF_REPO_GIT_TOOL_SPEC["name"],
-            description=HF_REPO_GIT_TOOL_SPEC["description"],
-            parameters=HF_REPO_GIT_TOOL_SPEC["parameters"],
-            handler=hf_repo_git_handler,
-        ),
-        ToolSpec(
-            name=GITHUB_FIND_EXAMPLES_TOOL_SPEC["name"],
-            description=GITHUB_FIND_EXAMPLES_TOOL_SPEC["description"],
-            parameters=GITHUB_FIND_EXAMPLES_TOOL_SPEC["parameters"],
-            handler=github_find_examples_handler,
-        ),
-        ToolSpec(
-            name=GITHUB_LIST_REPOS_TOOL_SPEC["name"],
-            description=GITHUB_LIST_REPOS_TOOL_SPEC["description"],
-            parameters=GITHUB_LIST_REPOS_TOOL_SPEC["parameters"],
-            handler=github_list_repos_handler,
-        ),
-        ToolSpec(
-            name=GITHUB_READ_FILE_TOOL_SPEC["name"],
-            description=GITHUB_READ_FILE_TOOL_SPEC["description"],
-            parameters=GITHUB_READ_FILE_TOOL_SPEC["parameters"],
-            handler=github_read_file_handler,
-        ),
-    ]
+def create_builtin_tools(mode_flags: ModeFlags | None = None) -> list[ToolSpec]:
+    """Create built-in tool specifications based on execution mode."""
+    # Default to cloud mode if no flags provided
+    if mode_flags is None:
+        mode_flags = ModeFlags(
+            local_tools=False, local_models=False,
+            network_tools=True, session_uploads=True, mcp_servers=True,
+        )
 
-    # Sandbox or local tools (highest priority)
-    if local_mode:
+    tools: list[ToolSpec] = []
+
+    # Compute tools (highest priority — prepended)
+    if mode_flags.local_tools:
         from agent.tools.local_tools import get_local_tools
-        tools = get_local_tools() + tools
+        tools.extend(get_local_tools())
     else:
-        tools = get_sandbox_tools() + tools
+        tools.extend(get_sandbox_tools())
+
+    # Planning — always available
+    tools.append(ToolSpec(
+        name=PLAN_TOOL_SPEC["name"],
+        description=PLAN_TOOL_SPEC["description"],
+        parameters=PLAN_TOOL_SPEC["parameters"],
+        handler=plan_tool_handler,
+    ))
+
+    # Network-dependent tools — only when network access is allowed
+    if mode_flags.network_tools:
+        tools.extend([
+            # Research sub-agent
+            ToolSpec(
+                name=RESEARCH_TOOL_SPEC["name"],
+                description=RESEARCH_TOOL_SPEC["description"],
+                parameters=RESEARCH_TOOL_SPEC["parameters"],
+                handler=research_handler,
+            ),
+            # Documentation search
+            ToolSpec(
+                name=EXPLORE_HF_DOCS_TOOL_SPEC["name"],
+                description=EXPLORE_HF_DOCS_TOOL_SPEC["description"],
+                parameters=EXPLORE_HF_DOCS_TOOL_SPEC["parameters"],
+                handler=explore_hf_docs_handler,
+            ),
+            ToolSpec(
+                name=HF_DOCS_FETCH_TOOL_SPEC["name"],
+                description=HF_DOCS_FETCH_TOOL_SPEC["description"],
+                parameters=HF_DOCS_FETCH_TOOL_SPEC["parameters"],
+                handler=hf_docs_fetch_handler,
+            ),
+            # Paper discovery and reading
+            ToolSpec(
+                name=HF_PAPERS_TOOL_SPEC["name"],
+                description=HF_PAPERS_TOOL_SPEC["description"],
+                parameters=HF_PAPERS_TOOL_SPEC["parameters"],
+                handler=hf_papers_handler,
+            ),
+            # Dataset inspection
+            ToolSpec(
+                name=HF_INSPECT_DATASET_TOOL_SPEC["name"],
+                description=HF_INSPECT_DATASET_TOOL_SPEC["description"],
+                parameters=HF_INSPECT_DATASET_TOOL_SPEC["parameters"],
+                handler=hf_inspect_dataset_handler,
+            ),
+            # HF Jobs (cloud training)
+            ToolSpec(
+                name=HF_JOBS_TOOL_SPEC["name"],
+                description=HF_JOBS_TOOL_SPEC["description"],
+                parameters=HF_JOBS_TOOL_SPEC["parameters"],
+                handler=hf_jobs_handler,
+            ),
+            # HF Repo management
+            ToolSpec(
+                name=HF_REPO_FILES_TOOL_SPEC["name"],
+                description=HF_REPO_FILES_TOOL_SPEC["description"],
+                parameters=HF_REPO_FILES_TOOL_SPEC["parameters"],
+                handler=hf_repo_files_handler,
+            ),
+            ToolSpec(
+                name=HF_REPO_GIT_TOOL_SPEC["name"],
+                description=HF_REPO_GIT_TOOL_SPEC["description"],
+                parameters=HF_REPO_GIT_TOOL_SPEC["parameters"],
+                handler=hf_repo_git_handler,
+            ),
+            # GitHub code search
+            ToolSpec(
+                name=GITHUB_FIND_EXAMPLES_TOOL_SPEC["name"],
+                description=GITHUB_FIND_EXAMPLES_TOOL_SPEC["description"],
+                parameters=GITHUB_FIND_EXAMPLES_TOOL_SPEC["parameters"],
+                handler=github_find_examples_handler,
+            ),
+            ToolSpec(
+                name=GITHUB_LIST_REPOS_TOOL_SPEC["name"],
+                description=GITHUB_LIST_REPOS_TOOL_SPEC["description"],
+                parameters=GITHUB_LIST_REPOS_TOOL_SPEC["parameters"],
+                handler=github_list_repos_handler,
+            ),
+            ToolSpec(
+                name=GITHUB_READ_FILE_TOOL_SPEC["name"],
+                description=GITHUB_READ_FILE_TOOL_SPEC["description"],
+                parameters=GITHUB_READ_FILE_TOOL_SPEC["parameters"],
+                handler=github_read_file_handler,
+            ),
+        ])
 
     tool_names = ", ".join([t.name for t in tools])
     logger.info(f"Loaded {len(tools)} built-in tools: {tool_names}")

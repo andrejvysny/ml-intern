@@ -80,12 +80,20 @@ class ContextManager:
         prompt_file_suffix: str = "system_prompt_v3.yaml",
         hf_token: str | None = None,
         local_mode: bool = False,
+        mode_flags: Any = None,
     ):
+        # Select prompt file based on execution mode
+        if mode_flags and mode_flags.local_models:
+            prompt_suffix = "system_prompt_local.yaml"
+        else:
+            prompt_suffix = "system_prompt_v3.yaml"
+
         self.system_prompt = self._load_system_prompt(
             tool_specs or [],
-            prompt_file_suffix="system_prompt_v3.yaml",
+            prompt_file_suffix=prompt_suffix,
             hf_token=hf_token,
             local_mode=local_mode,
+            mode_flags=mode_flags,
         )
         self.max_context = max_context - 10000
         self.compact_size = int(max_context * compact_size)
@@ -99,6 +107,7 @@ class ContextManager:
         prompt_file_suffix: str = "system_prompt.yaml",
         hf_token: str | None = None,
         local_mode: bool = False,
+        mode_flags: Any = None,
     ):
         """Load and render the system prompt from YAML file with Jinja2"""
         prompt_file = Path(__file__).parent.parent / "prompts" / f"{prompt_file_suffix}"
@@ -114,7 +123,7 @@ class ContextManager:
         current_time = now.strftime("%H:%M:%S.%f")[:-3]
         current_timezone = f"{now.strftime('%Z')} (UTC{now.strftime('%z')[:3]}:{now.strftime('%z')[3:]})"
 
-        # Get HF user info from OAuth token
+        # Get HF user info — skip network call when no token or in local mode
         hf_user_info = _get_hf_username(hf_token)
 
         template = Template(template_str)
@@ -137,6 +146,12 @@ class ContextManager:
                 f"Do NOT use /app/ paths — that is a sandbox convention that does not apply here.\n"
                 f"The sandbox_create tool is NOT available. Run code directly with bash."
             )
+            if mode_flags and not mode_flags.network_tools:
+                local_context += (
+                    "\n\nYou are in FULLY LOCAL mode. No network access is available. "
+                    "All tools that require internet (docs, papers, GitHub, HF Hub, Jobs) "
+                    "are disabled. Work entirely with local files and tools."
+                )
             static_prompt += local_context
 
         return (

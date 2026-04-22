@@ -19,7 +19,7 @@ from typing import Any, Optional
 import litellm
 from prompt_toolkit import PromptSession
 
-from agent.config import load_config
+from agent.config import ExecutionMode, load_config, resolve_mode_flags
 from agent.core.agent_loop import submission_loop
 from agent.core.session import OpType
 from agent.core.tools import ToolRouter
@@ -74,6 +74,10 @@ def _is_valid_model_id(model_id: str) -> bool:
         parts = model_id.split("/")
         return len(parts) >= 4 and all(parts)
     if model_id.startswith(("anthropic/", "openai/")):
+        parts = model_id.split("/", 1)
+        return len(parts) == 2 and bool(parts[1])
+    # Local model prefixes (litellm handles routing natively)
+    if model_id.startswith(("ollama/", "ollama_chat/", "vllm/")):
         parts = model_id.split("/", 1)
         return len(parts) == 2 and bool(parts[1])
     return False
@@ -710,7 +714,9 @@ def _handle_slash_command(
                 "Expected one of:\n"
                 "  • huggingface/<provider>/<org>/<model>\n"
                 "  • anthropic/<model>\n"
-                "  • openai/<model>"
+                "  • openai/<model>\n"
+                "  • ollama/<model>\n"
+                "  • vllm/<model>"
             )
             return None
         session = session_holder[0] if session_holder else None
@@ -736,11 +742,56 @@ def _handle_slash_command(
             print(f"Context items: {len(session.context_manager.items)}")
         return None
 
+    if command == "/mode":
+        mode = config.execution_mode.value if hasattr(config, "execution_mode") else "cloud"
+        flags = resolve_mode_flags(config)
+        print(f"Execution mode: {mode}")
+        print(f"  Local tools:    {'yes' if flags.local_tools else 'no'}")
+        print(f"  Local models:   {'yes' if flags.local_models else 'no'}")
+        print(f"  Network tools:  {'yes' if flags.network_tools else 'no'}")
+        print(f"  Session uploads: {'yes' if flags.session_uploads else 'no'}")
+        print(f"  MCP servers:    {'yes' if flags.mcp_servers else 'no'}")
+        return None
+
     print(f"Unknown command: {command}. Type /help for available commands.")
     return None
 
 
-async def main():
+def _detect_ollama_model(base_url: str = "http://localhost:11434") -> str | None:
+    """Check if ollama is running and return the largest available model."""
+    import requests
+    try:
+        resp = requests.get(f"{base_url}/api/tags", timeout=3)
+        if resp.status_code == 200:
+            models = resp.json().get("models", [])
+            if models:
+                best = max(models, key=lambda m: m.get("size", 0))
+                name = best.get("name", "")
+                if name:
+                    return f"ollama/{name}"
+    except Exception:
+        pass
+    return None
+
+
+def _apply_mode_overrides(config, cli_args: argparse.Namespace) -> None:
+    """Apply --local / --hybrid CLI flags to config."""
+    if getattr(cli_args, "local", False):
+        config.execution_mode = ExecutionMode.LOCAL
+        config.save_sessions = False
+        config.mcpServers = {}
+        if not getattr(cli_args, "model", None):
+            detected = _detect_ollama_model(config.local_model_base_url)
+            if detected:
+                config.model_name = detected
+            else:
+                config.model_name = config.local_model_name
+    elif getattr(cli_args, "hybrid", False):
+        config.execution_mode = ExecutionMode.HYBRID
+        config.save_sessions = False
+
+
+async def main(cli_args: argparse.Namespace | None = None):
     """Interactive chat with the agent"""
 
     # Clear screen
@@ -749,20 +800,37 @@ async def main():
     # Create prompt session for input (needed early for token prompt)
     prompt_session = PromptSession()
 
-    # HF token — required, prompt if missing
+    # Load config
+    config_path = (
+        Path(cli_args.config) if cli_args and cli_args.config
+        else Path(__file__).parent.parent / "configs" / "main_agent_config.json"
+    )
+    config = load_config(config_path)
+
+    # Apply CLI mode overrides
+    if cli_args:
+        _apply_mode_overrides(config, cli_args)
+
+    mode_flags = resolve_mode_flags(config)
+
+    # HF token — required for cloud/hybrid, optional for local
     hf_token = _get_hf_token()
-    if not hf_token:
+    if not hf_token and mode_flags.network_tools:
         hf_token = await _prompt_and_save_hf_token(prompt_session)
 
-    # Resolve username for banner
+    # Resolve username for banner (skip network call in local mode)
     hf_user = None
-    try:
-        from huggingface_hub import HfApi
-        hf_user = HfApi(token=hf_token).whoami().get("name")
-    except Exception:
-        pass
+    if hf_token and mode_flags.network_tools:
+        try:
+            from huggingface_hub import HfApi
+            hf_user = HfApi(token=hf_token).whoami().get("name")
+        except Exception:
+            pass
 
     print_banner(hf_user=hf_user)
+
+    if config.execution_mode != ExecutionMode.CLOUD:
+        get_console().print(f"[dim]Mode: {config.execution_mode.value}[/dim]")
 
     # Create queues for communication
     submission_queue = asyncio.Queue()
@@ -773,12 +841,10 @@ async def main():
     turn_complete_event.set()
     ready_event = asyncio.Event()
 
-    # Start agent loop in background
-    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
-    config = load_config(config_path)
-
-    # Create tool router with local mode
-    tool_router = ToolRouter(config.mcpServers, hf_token=hf_token, local_mode=True)
+    # Create tool router with mode flags
+    tool_router = ToolRouter(
+        config.mcpServers, hf_token=hf_token, mode_flags=mode_flags,
+    )
 
     # Session holder for interrupt/model/status access
     session_holder = [None]
@@ -791,8 +857,9 @@ async def main():
             tool_router=tool_router,
             session_holder=session_holder,
             hf_token=hf_token,
-            local_mode=True,
+            local_mode=mode_flags.local_tools,
             stream=True,
+            mode_flags=mode_flags,
         )
     )
 
@@ -906,22 +973,26 @@ async def headless_main(
     model: str | None = None,
     max_iterations: int | None = None,
     stream: bool = True,
+    cli_args: argparse.Namespace | None = None,
 ) -> None:
     """Run a single prompt headlessly and exit."""
     import logging
 
     logging.basicConfig(level=logging.WARNING)
 
-    hf_token = _get_hf_token()
-    if not hf_token:
-        print("ERROR: No HF token found. Set HF_TOKEN or run `huggingface-cli login`.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"HF token loaded", file=sys.stderr)
-
-    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
+    # Load config
+    config_path = (
+        Path(cli_args.config) if cli_args and cli_args.config
+        else Path(__file__).parent.parent / "configs" / "main_agent_config.json"
+    )
     config = load_config(config_path)
     config.yolo_mode = True  # Auto-approve everything in headless mode
+
+    # Apply CLI mode overrides
+    if cli_args:
+        _apply_mode_overrides(config, cli_args)
+
+    mode_flags = resolve_mode_flags(config)
 
     if model:
         config.model_name = model
@@ -929,7 +1000,17 @@ async def headless_main(
     if max_iterations is not None:
         config.max_iterations = max_iterations
 
+    # HF token — required for cloud/hybrid, optional for local
+    hf_token = _get_hf_token()
+    if not hf_token and mode_flags.network_tools:
+        print("ERROR: No HF token found. Set HF_TOKEN or run `huggingface-cli login`.", file=sys.stderr)
+        sys.exit(1)
+
+    if hf_token:
+        print("HF token loaded", file=sys.stderr)
+
     print(f"Model: {config.model_name}", file=sys.stderr)
+    print(f"Mode: {config.execution_mode.value}", file=sys.stderr)
     print(f"Max iterations: {config.max_iterations}", file=sys.stderr)
     print(f"Prompt: {prompt}", file=sys.stderr)
     print("---", file=sys.stderr)
@@ -937,7 +1018,9 @@ async def headless_main(
     submission_queue: asyncio.Queue = asyncio.Queue()
     event_queue: asyncio.Queue = asyncio.Queue()
 
-    tool_router = ToolRouter(config.mcpServers, hf_token=hf_token, local_mode=True)
+    tool_router = ToolRouter(
+        config.mcpServers, hf_token=hf_token, mode_flags=mode_flags,
+    )
     session_holder: list = [None]
 
     agent_task = asyncio.create_task(
@@ -948,8 +1031,9 @@ async def headless_main(
             tool_router=tool_router,
             session_holder=session_holder,
             hf_token=hf_token,
-            local_mode=True,
+            local_mode=mode_flags.local_tools,
             stream=stream,
+            mode_flags=mode_flags,
         )
     )
 
@@ -1071,13 +1155,21 @@ def cli():
     # Suppress whoosh invalid escape sequence warnings (third-party, unfixed upstream)
     warnings.filterwarnings("ignore", category=SyntaxWarning, module="whoosh")
 
-    parser = argparse.ArgumentParser(description="Hugging Face Agent CLI")
+    parser = argparse.ArgumentParser(description="ML Intern CLI")
     parser.add_argument("prompt", nargs="?", default=None, help="Run headlessly with this prompt")
-    parser.add_argument("--model", "-m", default=None, help=f"Model to use (default: from config)")
+    parser.add_argument("--model", "-m", default=None, help="Model to use (default: from config)")
     parser.add_argument("--max-iterations", type=int, default=None,
                         help="Max LLM requests per turn (default: 50, use -1 for unlimited)")
     parser.add_argument("--no-stream", action="store_true",
                         help="Disable token streaming (use non-streaming LLM calls)")
+    # Execution mode flags
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--local", action="store_true",
+                            help="Fully local: local LLM (ollama) + local tools, no network")
+    mode_group.add_argument("--hybrid", action="store_true",
+                            help="Hybrid: cloud LLM + local tools, no session uploads")
+    parser.add_argument("--config", default=None,
+                        help="Path to config file (default: configs/main_agent_config.json)")
     args = parser.parse_args()
 
     try:
@@ -1085,9 +1177,12 @@ def cli():
             max_iter = args.max_iterations
             if max_iter is not None and max_iter < 0:
                 max_iter = 10_000  # effectively unlimited
-            asyncio.run(headless_main(args.prompt, model=args.model, max_iterations=max_iter, stream=not args.no_stream))
+            asyncio.run(headless_main(
+                args.prompt, model=args.model, max_iterations=max_iter,
+                stream=not args.no_stream, cli_args=args,
+            ))
         else:
-            asyncio.run(main())
+            asyncio.run(main(cli_args=args))
     except KeyboardInterrupt:
         print("\n\nGoodbye!")
 

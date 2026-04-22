@@ -10,7 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.config import Config
+from agent.config import Config, ModeFlags, resolve_mode_flags
 from agent.context_manager.manager import ContextManager
 
 logger = logging.getLogger(__name__)
@@ -34,8 +34,10 @@ _MAX_TOKENS_MAP: dict[str, int] = {
 _DEFAULT_MAX_TOKENS = 200_000
 
 
-def _get_max_tokens_safe(model_name: str) -> int:
+def _get_max_tokens_safe(model_name: str, override: int | None = None) -> int:
     """Return the max context window for a model without network calls."""
+    if override:
+        return override
     tokens = _MAX_TOKENS_MAP.get(model_name)
     if tokens:
         return tokens
@@ -85,24 +87,35 @@ class Session:
         hf_token: str | None = None,
         local_mode: bool = False,
         stream: bool = True,
+        mode_flags: ModeFlags | None = None,
     ):
+        self.config = config or Config(
+            model_name="anthropic/claude-sonnet-4-5-20250929",
+        )
+        self.mode_flags = mode_flags or resolve_mode_flags(self.config)
         self.hf_token: Optional[str] = hf_token
         self.tool_router = tool_router
         self.stream = stream
+        # Use local_mode from mode_flags if not explicitly set
+        effective_local_mode = local_mode or self.mode_flags.local_tools
+        token_override = (
+            self.config.local_model_max_tokens
+            if self.mode_flags.local_models else None
+        )
         tool_specs = tool_router.get_tool_specs_for_llm() if tool_router else []
         self.context_manager = context_manager or ContextManager(
-            max_context=_get_max_tokens_safe(config.model_name),
+            max_context=_get_max_tokens_safe(
+                self.config.model_name, override=token_override
+            ),
             compact_size=0.1,
             untouched_messages=5,
             tool_specs=tool_specs,
             hf_token=hf_token,
-            local_mode=local_mode,
+            local_mode=effective_local_mode,
+            mode_flags=self.mode_flags,
         )
         self.event_queue = event_queue
         self.session_id = str(uuid.uuid4())
-        self.config = config or Config(
-            model_name="anthropic/claude-sonnet-4-5-20250929",
-        )
         self.is_running = True
         self._cancelled = asyncio.Event()
         self.pending_approval: Optional[dict[str, Any]] = None
@@ -143,7 +156,13 @@ class Session:
     def update_model(self, model_name: str) -> None:
         """Switch the active model and update the context window limit."""
         self.config.model_name = model_name
-        self.context_manager.max_context = _get_max_tokens_safe(model_name)
+        token_override = (
+            self.config.local_model_max_tokens
+            if self.mode_flags.local_models else None
+        )
+        self.context_manager.max_context = _get_max_tokens_safe(
+            model_name, override=token_override
+        )
 
     def increment_turn(self) -> None:
         """Increment turn counter (called after each user interaction)"""

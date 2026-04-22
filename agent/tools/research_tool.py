@@ -217,6 +217,10 @@ def _resolve_llm_params(
     model_name: str, session_hf_token: str | None = None
 ) -> dict:
     """Build LiteLLM kwargs, reusing the HF router logic from agent_loop."""
+    # Local models — litellm handles natively
+    if model_name.startswith(("ollama/", "ollama_chat/", "vllm/")):
+        return {"model": model_name}
+
     if not model_name.startswith("huggingface/"):
         return {"model": model_name}
 
@@ -241,6 +245,9 @@ def _resolve_llm_params(
 
 def _get_research_model(main_model: str) -> str:
     """Pick a cheaper model for research based on the main model."""
+    # Local models — use the same model for research
+    if main_model.startswith(("ollama/", "ollama_chat/", "vllm/")):
+        return main_model
     if "anthropic/" in main_model:
         return "anthropic/claude-sonnet-4-6"
     # For non-Anthropic models (HF router etc.), use the same model
